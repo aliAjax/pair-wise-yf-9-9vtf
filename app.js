@@ -3,6 +3,7 @@ const today = new Date();
 
 const defaultState = {
   selectedId: "",
+  reviewSessions: {},
   games: [
     {
       id: crypto.randomUUID(),
@@ -75,11 +76,11 @@ const els = {
 
 function loadState() {
   const saved = localStorage.getItem(storageKey);
-  if (!saved) return structuredClone(defaultState);
+  if (!saved) return StorageCompat.migrate(null, defaultState);
   try {
-    return { ...structuredClone(defaultState), ...JSON.parse(saved) };
+    return StorageCompat.migrate(JSON.parse(saved), defaultState);
   } catch {
-    return structuredClone(defaultState);
+    return StorageCompat.migrate(null, defaultState);
   }
 }
 
@@ -180,6 +181,7 @@ function renderDetail() {
       ${renderRuleSection("常见争议", "disputes", game.disputes)}
       ${renderRuleSection("开局准备", "setup", game.setup)}
       ${renderRuleSection("计分提醒", "scoring", game.scoring)}
+      ${renderReviewSection(game)}
       <form class="add-rule" id="ruleForm">
         <select id="ruleTypeInput">
           <option value="forgets">容易忘的规则</option>
@@ -216,6 +218,63 @@ function renderRuleSection(title, key, items) {
             .join("") || `<li><span>暂无内容。</span></li>`
         }
       </ul>
+    </section>
+  `;
+}
+
+function renderReviewSection(game) {
+  const session = state.reviewSessions[game.id];
+  if (session && ReviewQueue.currentCard(session)) return renderReviewCard(session);
+
+  const lastReview = game.reviews[game.reviews.length - 1];
+  const totalCards = ReviewQueue.buildCards(game).length;
+  return `
+    <section class="rule-section review-section">
+      <h3>记忆速览</h3>
+      <p class="review-meta">${
+        lastReview
+          ? `最近复习：${lastReview.date} · 正确率 ${lastReview.accuracy}%（记得 ${lastReview.remembered}/${lastReview.total}）· 累计 ${game.reviews.length} 次`
+          : "还没有复习记录，本次按首次复习处理。"
+      }</p>
+      <button class="primary" id="startReviewBtn" type="button" ${totalCards ? "" : "disabled"}>
+        ${totalCards ? `开始记忆速览（共 ${totalCards} 张）` : "暂无提醒可复习"}
+      </button>
+    </section>
+  `;
+}
+
+function renderReviewCard(session) {
+  const card = ReviewQueue.currentCard(session);
+  const repeat = Boolean(card.firstResult); // 提示阶段：是否再次出现
+  const counted = session.revealed && !session.lastWasRepeat; // 揭示阶段：本次是否首次作答
+  const choiceLabel = session.lastChoice === "remembered" ? "记得" : "忘了";
+  return `
+    <section class="rule-section review-section">
+      <div class="panel-head">
+        <h3>记忆速览</h3>
+        <span>剩余 ${session.queue.length} / ${session.cards.length} 张</span>
+      </div>
+      <div class="review-card">
+        <p class="review-hint">${escapeHtml(card.typeLabel)} · 第 ${card.index} 条${repeat ? " · 再次复习" : ""}</p>
+        ${
+          session.revealed
+            ? `
+              <p class="review-text">${escapeHtml(card.text)}</p>
+              <p class="review-meta">
+                本次选择“${choiceLabel}”，${counted ? "首次作答，已计入正确率" : "重复出现，不计入正确率"}${session.lastChoice === "forgotten" ? "，会隔两张再出现" : ""}
+              </p>
+              <button class="primary" id="reviewNextBtn" type="button">下一张</button>
+            `
+            : `
+              <p class="review-tip">先在心里回忆这条提醒，选择是否记得后揭示原文。</p>
+              <div class="review-actions">
+                <button id="reviewRememberBtn" type="button">记得</button>
+                <button id="reviewForgotBtn" type="button">忘了</button>
+              </div>
+            `
+        }
+      </div>
+      <button class="link" id="restartReviewBtn" type="button">重新开始本次速览</button>
     </section>
   `;
 }
@@ -306,12 +365,52 @@ els.detailView.addEventListener("submit", (event) => {
   renderAll();
 });
 
+// 记忆速览的点击处理：返回 true 表示这次点击已被消费
+function handleReviewClick(event, game) {
+  if (event.target.closest("#startReviewBtn")) {
+    state.reviewSessions[game.id] = ReviewQueue.createSession(game);
+    renderAll();
+    return true;
+  }
+
+  const session = state.reviewSessions[game.id];
+  if (!session) return false;
+
+  const rememberBtn = event.target.closest("#reviewRememberBtn");
+  const forgotBtn = event.target.closest("#reviewForgotBtn");
+  if (rememberBtn || forgotBtn) {
+    ReviewQueue.answer(session, rememberBtn ? "remembered" : "forgotten");
+    renderAll();
+    return true;
+  }
+
+  if (event.target.closest("#reviewNextBtn")) {
+    ReviewQueue.advance(session);
+    if (ReviewQueue.isFinished(session)) {
+      game.reviews.push(ReviewQueue.summarize(session));
+      delete state.reviewSessions[game.id];
+    }
+    renderAll();
+    return true;
+  }
+
+  if (event.target.closest("#restartReviewBtn")) {
+    state.reviewSessions[game.id] = ReviewQueue.createSession(game);
+    renderAll();
+    return true;
+  }
+
+  return false;
+}
+
 els.detailView.addEventListener("click", (event) => {
   const ruleButton = event.target.closest("[data-rule-key]");
   const playedButton = event.target.closest("#playedTodayBtn");
   const deleteButton = event.target.closest("#deleteGameBtn");
   const game = state.games.find((item) => item.id === state.selectedId);
   if (!game) return;
+
+  if (handleReviewClick(event, game)) return;
 
   if (ruleButton) {
     const key = ruleButton.dataset.ruleKey;
@@ -327,6 +426,7 @@ els.detailView.addEventListener("click", (event) => {
 
   if (deleteButton) {
     state.games = state.games.filter((item) => item.id !== game.id);
+    delete state.reviewSessions[game.id];
     state.selectedId = state.games[0]?.id || "";
     renderAll();
   }
