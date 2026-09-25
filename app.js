@@ -75,16 +75,138 @@ const els = {
 
 function loadState() {
   const saved = localStorage.getItem(storageKey);
-  if (!saved) return structuredClone(defaultState);
-  try {
-    return { ...structuredClone(defaultState), ...JSON.parse(saved) };
-  } catch {
-    return structuredClone(defaultState);
+  let loaded;
+  if (!saved) {
+    loaded = structuredClone(defaultState);
+  } else {
+    try {
+      loaded = { ...structuredClone(defaultState), ...JSON.parse(saved) };
+    } catch {
+      loaded = structuredClone(defaultState);
+    }
   }
+  // 旧数据兼容：老收藏缺少速览字段时按首次处理
+  loaded.games = (Array.isArray(loaded.games) ? loaded.games : []).map(normalizeGame);
+  return loaded;
 }
 
 function saveState() {
   localStorage.setItem(storageKey, JSON.stringify(state));
+}
+
+// ---------- 记忆速览：队列状态 ----------
+
+const reviewTypeOrder = [
+  ["forgets", "容易忘的规则"],
+  ["disputes", "常见争议"],
+  ["setup", "开局准备"],
+  ["scoring", "计分提醒"]
+];
+
+function todayString() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function buildReviewQueue(game) {
+  // 四类提醒按原顺序生成复习卡，重复提醒各算一张
+  return reviewTypeOrder.flatMap(([key, label]) =>
+    game[key].map((text) => ({
+      id: crypto.randomUUID(),
+      type: label,
+      text,
+      judged: false,
+      revealed: false,
+      result: ""
+    }))
+  );
+}
+
+function startReview(game) {
+  const queue = buildReviewQueue(game);
+  if (!queue.length) return;
+  game.review = {
+    queue,
+    total: queue.length,
+    remembered: 0,
+    forgotten: 0,
+    started: todayString(),
+    finished: false,
+    accuracy: 0
+  };
+}
+
+function answerReviewCard(game, result) {
+  const review = game.review;
+  const card = review?.queue[0];
+  if (!card || card.revealed) return;
+  // 每张卡只按第一次选择计入正确率
+  if (!card.judged) {
+    card.judged = true;
+    if (result === "remembered") review.remembered += 1;
+    else review.forgotten += 1;
+  }
+  card.result = result;
+  card.revealed = true;
+}
+
+function advanceReview(game) {
+  const review = game.review;
+  const card = review?.queue[0];
+  if (!card || !card.revealed) return;
+  review.queue.shift();
+  if (card.result === "forgotten") {
+    // 忘了的隔两张再出现，记得的移走
+    card.revealed = false;
+    card.result = "";
+    review.queue.splice(2, 0, card);
+  }
+  if (!review.queue.length) finishReview(game);
+}
+
+function finishReview(game) {
+  const review = game.review;
+  review.finished = true;
+  review.accuracy = review.total ? Math.round((review.remembered / review.total) * 100) : 0;
+  // 结束后记下正确率和日期
+  game.reviewHistory.push({
+    date: todayString(),
+    total: review.total,
+    remembered: review.remembered,
+    accuracy: review.accuracy
+  });
+}
+
+// ---------- 记忆速览：旧数据兼容 ----------
+
+function normalizeReview(review) {
+  if (!review || !Array.isArray(review.queue)) return null;
+  const queue = review.queue
+    .filter((card) => card && typeof card.text === "string")
+    .map((card) => ({
+      id: card.id || crypto.randomUUID(),
+      type: card.type || reviewTypeOrder[0][1],
+      text: card.text,
+      judged: Boolean(card.judged),
+      revealed: Boolean(card.revealed),
+      result: card.result === "remembered" || card.result === "forgotten" ? card.result : ""
+    }));
+  return {
+    queue,
+    total: Number(review.total) || queue.length,
+    remembered: Number(review.remembered) || 0,
+    forgotten: Number(review.forgotten) || 0,
+    started: review.started || todayString(),
+    finished: Boolean(review.finished),
+    accuracy: Number(review.accuracy) || 0
+  };
+}
+
+function normalizeGame(game) {
+  return {
+    ...game,
+    review: normalizeReview(game.review),
+    reviewHistory: Array.isArray(game.reviewHistory) ? game.reviewHistory : []
+  };
 }
 
 function daysSince(dateString) {
@@ -155,6 +277,79 @@ function renderList() {
       .join("") || `<p class="empty">没有符合筛选的桌游。</p>`;
 }
 
+// ---------- 记忆速览：页面展示 ----------
+
+function maskRuleText(text) {
+  const keep = Math.min(4, Math.max(1, Math.ceil(text.length / 4)));
+  return `${escapeHtml(text.slice(0, keep))}……（共${text.length}字）`;
+}
+
+function renderReviewBlock(game) {
+  const review = game.review;
+  if (review && !review.finished && review.queue.length) return renderReviewSession(review);
+  if (review?.finished) return renderReviewFinished(game, review);
+  return renderReviewStart(game);
+}
+
+function renderReviewStart(game) {
+  const total = getAllRules(game).length;
+  const last = game.reviewHistory[game.reviewHistory.length - 1];
+  const record = last
+    ? `上次速览 ${last.date} · 正确率 ${last.accuracy}%（${last.remembered}/${last.total}）`
+    : "还没有速览记录，本次按首次处理";
+  return `
+    <section class="review-block">
+      <div class="panel-head">
+        <h3>记忆速览</h3>
+        <span>${record}</span>
+      </div>
+      <p class="review-tip">四类提醒共 ${total} 张卡，先看提示回忆，再核对原文。</p>
+      <button class="primary" id="startReviewBtn" type="button" ${total ? "" : "disabled"}>开始记忆速览</button>
+    </section>
+  `;
+}
+
+function renderReviewSession(review) {
+  const card = review.queue[0];
+  const judged = review.remembered + review.forgotten;
+  return `
+    <section class="review-block">
+      <div class="panel-head">
+        <h3>记忆速览</h3>
+        <span>队列剩余 ${review.queue.length} 张 · 已判断 ${judged}/${review.total}</span>
+      </div>
+      <div class="review-card">
+        <span class="pill">${card.type}</span>
+        ${
+          card.revealed
+            ? `<p class="review-text">${escapeHtml(card.text)}</p>
+               <p class="review-note">${card.result === "forgotten" ? "这张会隔两张再出现。" : "这张已记住，移出队列。"}</p>
+               <button class="primary" id="nextCardBtn" type="button">下一张</button>`
+            : `<p class="review-hint">${maskRuleText(card.text)}</p>
+               <div class="review-actions">
+                 <button class="remember" id="rememberBtn" type="button">记得</button>
+                 <button class="forget" id="forgetBtn" type="button">忘了</button>
+               </div>`
+        }
+      </div>
+    </section>
+  `;
+}
+
+function renderReviewFinished(game, review) {
+  const record = game.reviewHistory[game.reviewHistory.length - 1];
+  return `
+    <section class="review-block">
+      <div class="panel-head">
+        <h3>本次速览完成</h3>
+        <span>${record ? record.date : ""}</span>
+      </div>
+      <p class="review-tip">正确率 ${review.accuracy}%（记得 ${review.remembered} / 共 ${review.total} 张），已记录。</p>
+      <button class="primary" id="startReviewBtn" type="button">再复习一次</button>
+    </section>
+  `;
+}
+
 function renderDetail() {
   const game = state.games.find((item) => item.id === state.selectedId) || state.games[0];
   if (!game) {
@@ -176,6 +371,7 @@ function renderDetail() {
           <span class="pill">${daysSince(game.lastPlayed)}天未玩</span>
         </div>
       </div>
+      ${renderReviewBlock(game)}
       ${renderRuleSection("容易忘的规则", "forgets", game.forgets)}
       ${renderRuleSection("常见争议", "disputes", game.disputes)}
       ${renderRuleSection("开局准备", "setup", game.setup)}
@@ -257,7 +453,9 @@ async function addGame(event) {
     forgets: ["本局开始前先补充容易忘的规则。"],
     disputes: [],
     setup: ["整理组件并按人数调整初始设置。"],
-    scoring: ["确认终局计分项和即时得分项。"]
+    scoring: ["确认终局计分项和即时得分项。"],
+    review: null,
+    reviewHistory: []
   };
   state.games.unshift(game);
   state.selectedId = game.id;
@@ -310,6 +508,10 @@ els.detailView.addEventListener("click", (event) => {
   const ruleButton = event.target.closest("[data-rule-key]");
   const playedButton = event.target.closest("#playedTodayBtn");
   const deleteButton = event.target.closest("#deleteGameBtn");
+  const startButton = event.target.closest("#startReviewBtn");
+  const rememberButton = event.target.closest("#rememberBtn");
+  const forgetButton = event.target.closest("#forgetBtn");
+  const nextButton = event.target.closest("#nextCardBtn");
   const game = state.games.find((item) => item.id === state.selectedId);
   if (!game) return;
 
@@ -328,6 +530,26 @@ els.detailView.addEventListener("click", (event) => {
   if (deleteButton) {
     state.games = state.games.filter((item) => item.id !== game.id);
     state.selectedId = state.games[0]?.id || "";
+    renderAll();
+  }
+
+  if (startButton) {
+    startReview(game);
+    renderAll();
+  }
+
+  if (rememberButton) {
+    answerReviewCard(game, "remembered");
+    renderAll();
+  }
+
+  if (forgetButton) {
+    answerReviewCard(game, "forgotten");
+    renderAll();
+  }
+
+  if (nextButton) {
+    advanceReview(game);
     renderAll();
   }
 });
